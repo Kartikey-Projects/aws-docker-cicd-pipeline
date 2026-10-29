@@ -9,7 +9,26 @@ env:
   ECR_REPOSITORY: aws-docker-cicd-pipeline
 
 jobs:
-  deploy:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Run tests
+        working-directory: app
+        run: python -m pytest -q
+
+  build-and-deploy:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -26,14 +45,27 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker image
+      - name: Build Docker image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           docker build -t $REGISTRY/$ECR_REPOSITORY:${{ github.sha }} -t $REGISTRY/$ECR_REPOSITORY:latest .
+
+      - name: Scan image with Trivy
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image \
+            --severity CRITICAL --ignore-unfixed --exit-code 1 \
+            $REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+
+      - name: Push image to ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
           docker push --all-tags $REGISTRY/$ECR_REPOSITORY
 
-      - name: Deploy to EC2
+      - name: Deploy to EC2 with health check and rollback
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -41,8 +73,32 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+            NEW_IMAGE=$REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
             aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin $REGISTRY
-            docker pull $REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+
+            # remember the image that is running now, so we can roll back to it
+            PREV_ID=$(docker inspect --format='{{.Image}}' myapp 2>/dev/null || true)
+
+            docker pull $NEW_IMAGE
             docker stop myapp || true
             docker rm myapp || true
-            docker run -d --name myapp --restart always -p 80:5000 $REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+            docker run -d --name myapp --restart always -p 80:5000 $NEW_IMAGE
+
+            # health check: up to 10 tries, 3 seconds apart
+            for i in $(seq 1 10); do
+              if curl -fs http://localhost/health > /dev/null; then
+                echo "Health check passed. Deployment successful."
+                exit 0
+              fi
+              echo "Waiting for the app to become healthy ($i/10)..."
+              sleep 3
+            done
+
+            echo "Health check FAILED. Rolling back."
+            docker rm -f myapp || true
+            if [ -n "$PREV_ID" ]; then
+              docker run -d --name myapp --restart always -p 80:5000 $PREV_ID
+              echo "Rolled back to the previous version."
+            fi
+            exit 1
