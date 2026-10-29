@@ -13,3 +13,4 @@ EXPOSE 5000
 
 CMD ["python", "-m", "gunicorn", "-b", "0.0.0.0:5000", "app:app"]
 
+
